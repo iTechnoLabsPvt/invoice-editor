@@ -170,6 +170,4 @@ node scripts/verify-calculations.mjs
 
 ---
 
-## 🎬 Walkthrough Video Script
-
 See [`WALKTHROUGH_SCRIPT.md`](./WALKTHROUGH_SCRIPT.md) for the 3-minute video presentation guide covering the live demo, technical highlights, and accounting architecture.
