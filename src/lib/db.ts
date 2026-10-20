@@ -3,12 +3,11 @@ import path from 'node:path';
 import { Invoice, InvoiceSummary } from '@/types/invoice';
 import { CHECK_CASE_INVOICE, DEFAULT_INVOICE } from './sample-data';
 
-// Determine data directory
+// Persistent file paths
 const DATA_DIR = path.join(process.cwd(), 'data');
 const DB_FILE = path.join(DATA_DIR, 'invoices.db');
-const JSON_BACKUP_FILE = path.join(DATA_DIR, 'invoices_fallback.json');
+const JSON_FILE = path.join(DATA_DIR, 'invoices.json');
 
-// Interface for database operations
 interface IDatabaseHandler {
   save(invoice: Invoice): Invoice;
   get(id: string): Invoice | null;
@@ -16,21 +15,11 @@ interface IDatabaseHandler {
   delete(id: string): boolean;
 }
 
-// Memory fallback store
-const memoryStore = new Map<string, Invoice>();
+// In-memory cache synced with persistent disk storage
+const store = new Map<string, Invoice>();
 
-// Initialize fallback with sample data
-function initMemoryStore() {
-  if (memoryStore.size === 0) {
-    memoryStore.set(CHECK_CASE_INVOICE.id, CHECK_CASE_INVOICE);
-    memoryStore.set(DEFAULT_INVOICE.id, DEFAULT_INVOICE);
-  }
-}
-
-// SQLite Database Implementation using node:sqlite (built into Node 22+)
-class SqliteDatabaseHandler implements IDatabaseHandler {
-  private db: any = null;
-
+// File Storage Engine (Reliable, persistent across server restarts)
+class FileStorageEngine {
   constructor() {
     this.init();
   }
@@ -41,13 +30,103 @@ class SqliteDatabaseHandler implements IDatabaseHandler {
         fs.mkdirSync(DATA_DIR, { recursive: true });
       }
 
-      // Dynamic import / require of node:sqlite
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const { DatabaseSync } = require('node:sqlite');
-      this.db = new DatabaseSync(DB_FILE);
+      if (fs.existsSync(JSON_FILE)) {
+        const raw = fs.readFileSync(JSON_FILE, 'utf-8');
+        const parsed = JSON.parse(raw) as Record<string, Invoice>;
+        for (const [id, inv] of Object.entries(parsed)) {
+          store.set(id, inv);
+        }
+      } else {
+        // Seed default records on first run
+        store.set(CHECK_CASE_INVOICE.id, CHECK_CASE_INVOICE);
+        store.set(DEFAULT_INVOICE.id, DEFAULT_INVOICE);
+        this.flush();
+      }
+    } catch (err) {
+      console.warn('[DB] Storage init warning:', err);
+      // Fallback in-memory seed
+      if (store.size === 0) {
+        store.set(CHECK_CASE_INVOICE.id, CHECK_CASE_INVOICE);
+        store.set(DEFAULT_INVOICE.id, DEFAULT_INVOICE);
+      }
+    }
+  }
 
-      // Create table
-      this.db.exec(`
+  save(invoice: Invoice): Invoice {
+    const now = new Date().toISOString();
+    const updatedInvoice: Invoice = {
+      ...invoice,
+      updatedAt: now,
+      createdAt: invoice.createdAt || now,
+    };
+    store.set(updatedInvoice.id, updatedInvoice);
+    this.flush();
+    return updatedInvoice;
+  }
+
+  get(id: string): Invoice | null {
+    return store.get(id) || null;
+  }
+
+  list(): InvoiceSummary[] {
+    return Array.from(store.values())
+      .map((inv) => ({
+        id: inv.id,
+        invoiceNumber: inv.metadata.invoiceNumber,
+        clientName: inv.client.company || inv.client.name || 'Unnamed Client',
+        issueDate: inv.metadata.issueDate,
+        dueDate: inv.metadata.dueDate,
+        grandTotal: inv.totals.grandTotal,
+        status: inv.metadata.status,
+        updatedAt: inv.updatedAt,
+      }))
+      .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+  }
+
+  delete(id: string): boolean {
+    const existed = store.delete(id);
+    if (existed) {
+      this.flush();
+    }
+    return existed;
+  }
+
+  private flush() {
+    try {
+      if (!fs.existsSync(DATA_DIR)) {
+        fs.mkdirSync(DATA_DIR, { recursive: true });
+      }
+      const data = Object.fromEntries(store);
+      fs.writeFileSync(JSON_FILE, JSON.stringify(data, null, 2), 'utf-8');
+    } catch (err) {
+      console.warn('[DB] Error writing to disk store:', err);
+    }
+  }
+}
+
+// SQLite storage handler with runtime dynamic import to avoid Turbopack bundling bugs
+class HybridDatabaseHandler implements IDatabaseHandler {
+  private sqliteDb: any = null;
+  private fileFallback: FileStorageEngine;
+
+  constructor() {
+    this.fileFallback = new FileStorageEngine();
+    this.initSqlite();
+  }
+
+  private initSqlite() {
+    try {
+      // Use eval('require') so Turbopack does not attempt static bundling of 'node:sqlite'
+      // eslint-disable-next-line no-eval
+      const runtimeRequire = eval('require');
+      const { DatabaseSync } = runtimeRequire('node:sqlite');
+      
+      if (!fs.existsSync(DATA_DIR)) {
+        fs.mkdirSync(DATA_DIR, { recursive: true });
+      }
+
+      this.sqliteDb = new DatabaseSync(DB_FILE);
+      this.sqliteDb.exec(`
         CREATE TABLE IF NOT EXISTS invoices (
           id TEXT PRIMARY KEY,
           invoice_number TEXT NOT NULL,
@@ -62,36 +141,24 @@ class SqliteDatabaseHandler implements IDatabaseHandler {
         );
       `);
 
-      // Seed if empty
-      const countStmt = this.db.prepare('SELECT COUNT(*) as count FROM invoices');
+      // Seed sqlite from file storage
+      const countStmt = this.sqliteDb.prepare('SELECT COUNT(*) as count FROM invoices');
       const row = countStmt.get();
       if (!row || row.count === 0) {
-        this.save(CHECK_CASE_INVOICE);
-        this.save(DEFAULT_INVOICE);
+        for (const invoice of store.values()) {
+          this.saveToSqlite(invoice);
+        }
       }
-    } catch (err) {
-      console.warn('[DB] SQLite initialization failed, falling back to JSON storage:', err);
-      this.db = null;
-      initMemoryStore();
+    } catch {
+      // If node:sqlite is unavailable in this runtime context, fileFallback handles all operations smoothly
+      this.sqliteDb = null;
     }
   }
 
-  save(invoice: Invoice): Invoice {
-    const now = new Date().toISOString();
-    const updatedInvoice: Invoice = {
-      ...invoice,
-      updatedAt: now,
-      createdAt: invoice.createdAt || now,
-    };
-
-    if (!this.db) {
-      memoryStore.set(updatedInvoice.id, updatedInvoice);
-      this.saveToJsonFallback();
-      return updatedInvoice;
-    }
-
+  private saveToSqlite(invoice: Invoice) {
+    if (!this.sqliteDb) return;
     try {
-      const stmt = this.db.prepare(`
+      const stmt = this.sqliteDb.prepare(`
         INSERT INTO invoices (id, invoice_number, client_name, issue_date, due_date, grand_total, status, data_json, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
@@ -106,106 +173,80 @@ class SqliteDatabaseHandler implements IDatabaseHandler {
       `);
 
       stmt.run(
-        updatedInvoice.id,
-        updatedInvoice.metadata.invoiceNumber,
-        updatedInvoice.client.name || updatedInvoice.client.company || 'Unnamed Client',
-        updatedInvoice.metadata.issueDate,
-        updatedInvoice.metadata.dueDate,
-        updatedInvoice.totals.grandTotal,
-        updatedInvoice.metadata.status,
-        JSON.stringify(updatedInvoice),
-        updatedInvoice.createdAt,
-        updatedInvoice.updatedAt
+        invoice.id,
+        invoice.metadata.invoiceNumber,
+        invoice.client.company || invoice.client.name || 'Unnamed Client',
+        invoice.metadata.issueDate,
+        invoice.metadata.dueDate,
+        invoice.totals.grandTotal,
+        invoice.metadata.status,
+        JSON.stringify(invoice),
+        invoice.createdAt,
+        invoice.updatedAt
       );
-
-      return updatedInvoice;
     } catch (err) {
-      console.error('[DB] SQLite save error, saving to memory fallback:', err);
-      memoryStore.set(updatedInvoice.id, updatedInvoice);
-      return updatedInvoice;
+      console.warn('[DB] SQLite save warning:', err);
     }
+  }
+
+  save(invoice: Invoice): Invoice {
+    const saved = this.fileFallback.save(invoice);
+    this.saveToSqlite(saved);
+    return saved;
   }
 
   get(id: string): Invoice | null {
-    if (!this.db) {
-      return memoryStore.get(id) || null;
-    }
-
-    try {
-      const stmt = this.db.prepare('SELECT data_json FROM invoices WHERE id = ?');
-      const row = stmt.get(id);
-      if (row && row.data_json) {
-        return JSON.parse(row.data_json) as Invoice;
+    if (this.sqliteDb) {
+      try {
+        const stmt = this.sqliteDb.prepare('SELECT data_json FROM invoices WHERE id = ?');
+        const row = stmt.get(id);
+        if (row && row.data_json) {
+          return JSON.parse(row.data_json) as Invoice;
+        }
+      } catch (err) {
+        console.warn('[DB] SQLite get error, falling back:', err);
       }
-      return memoryStore.get(id) || null;
-    } catch (err) {
-      console.error('[DB] SQLite get error:', err);
-      return memoryStore.get(id) || null;
     }
+    return this.fileFallback.get(id);
   }
 
   list(): InvoiceSummary[] {
-    if (!this.db) {
-      return Array.from(memoryStore.values()).map((inv) => ({
-        id: inv.id,
-        invoiceNumber: inv.metadata.invoiceNumber,
-        clientName: inv.client.company || inv.client.name || 'Unnamed Client',
-        issueDate: inv.metadata.issueDate,
-        dueDate: inv.metadata.dueDate,
-        grandTotal: inv.totals.grandTotal,
-        status: inv.metadata.status,
-        updatedAt: inv.updatedAt,
-      })).sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+    if (this.sqliteDb) {
+      try {
+        const stmt = this.sqliteDb.prepare(`
+          SELECT id, invoice_number as invoiceNumber, client_name as clientName,
+                 issue_date as issueDate, due_date as dueDate, grand_total as grandTotal,
+                 status, updated_at as updatedAt
+          FROM invoices
+          ORDER BY updated_at DESC
+        `);
+        const rows = stmt.all() as InvoiceSummary[];
+        if (rows && rows.length > 0) return rows;
+      } catch (err) {
+        console.warn('[DB] SQLite list error, falling back:', err);
+      }
     }
-
-    try {
-      const stmt = this.db.prepare(`
-        SELECT id, invoice_number as invoiceNumber, client_name as clientName,
-               issue_date as issueDate, due_date as dueDate, grand_total as grandTotal,
-               status, updated_at as updatedAt
-        FROM invoices
-        ORDER BY updated_at DESC
-      `);
-      return stmt.all() as InvoiceSummary[];
-    } catch (err) {
-      console.error('[DB] SQLite list error:', err);
-      return [];
-    }
+    return this.fileFallback.list();
   }
 
   delete(id: string): boolean {
-    memoryStore.delete(id);
-    if (!this.db) return true;
-
-    try {
-      const stmt = this.db.prepare('DELETE FROM invoices WHERE id = ?');
-      stmt.run(id);
-      return true;
-    } catch (err) {
-      console.error('[DB] SQLite delete error:', err);
-      return false;
-    }
-  }
-
-  private saveToJsonFallback() {
-    try {
-      if (!fs.existsSync(DATA_DIR)) {
-        fs.mkdirSync(DATA_DIR, { recursive: true });
+    if (this.sqliteDb) {
+      try {
+        const stmt = this.sqliteDb.prepare('DELETE FROM invoices WHERE id = ?');
+        stmt.run(id);
+      } catch (err) {
+        console.warn('[DB] SQLite delete warning:', err);
       }
-      const data = Object.fromEntries(memoryStore);
-      fs.writeFileSync(JSON_BACKUP_FILE, JSON.stringify(data, null, 2), 'utf-8');
-    } catch (err) {
-      console.warn('[DB] Fallback JSON write warning:', err);
     }
+    return this.fileFallback.delete(id);
   }
 }
 
-// Global singleton instance
 let dbInstance: IDatabaseHandler | null = null;
 
 export function getDatabase(): IDatabaseHandler {
   if (!dbInstance) {
-    dbInstance = new SqliteDatabaseHandler();
+    dbInstance = new HybridDatabaseHandler();
   }
   return dbInstance;
 }
